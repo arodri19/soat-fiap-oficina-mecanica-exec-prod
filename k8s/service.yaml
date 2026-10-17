@@ -1,0 +1,35 @@
+# Público: mecânicos (fila de execução, diagnóstico, reparo).
+apiVersion: v1
+kind: Service
+metadata:
+  name: exec-prod-service-public
+  namespace: oficina-mecanica
+  labels:
+    app: exec-prod-service
+    app.kubernetes.io/part-of: oficina-mecanica
+spec:
+  type: LoadBalancer
+  selector:
+    app: exec-prod-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 4200
+---
+# Interno: REST síncrono do os-service (http://exec-prod-service.oficina-mecanica.svc.cluster.local)
+apiVersion: v1
+kind: Service
+metadata:
+  name: exec-prod-service
+  namespace: oficina-mecanica
+  labels:
+    app: exec-prod-service
+    app.kubernetes.io/part-of: oficina-mecanica
+spec:
+  type: ClusterIP
+  selector:
+    app: exec-prod-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 4200
