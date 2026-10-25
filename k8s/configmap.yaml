@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: exec-prod-service-config
+  namespace: oficina-mecanica
+  labels:
+    app.kubernetes.io/name: exec-prod-service
+    app.kubernetes.io/part-of: oficina-mecanica
+data:
+  PORT: "4200"
+  LOG_LEVEL: "info"
+  NEW_RELIC_APP_NAME: "oficina-exec-prod-service"
+  AWS_REGION: "us-east-1"
+  QUEUE_PREFIX: "oficina-mecanica-dev"
+  MAX_ACTIVE_EXECUTIONS: "10"
+  OUTBOX_RETRY_INTERVAL_MS: "10000"
