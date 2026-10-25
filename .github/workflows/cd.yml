@@ -1,0 +1,153 @@
+name: CD — Deploy automatizado no Kubernetes (EKS)
+
+# Deploy AUTOMÁTICO a cada merge em homologacao/main (só via PR com CI verde).
+# Infra sob demanda (ADR 0007, Fase 3): sem cluster EKS de pé, publica a imagem e
+# pula o deploy com aviso.
+#
+# Secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+#          JWT_SECRET, NEW_RELIC_LICENSE_KEY, SONAR_TOKEN
+# Variables: AWS_REGION, TF_STATE_BUCKET, DEPLOY_ENVIRONMENT, MAX_ACTIVE_EXECUTIONS
+on:
+  push:
+    branches: [main, homologacao]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Ambiente alvo'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, prod]
+
+concurrency:
+  group: cd-exec-prod-service-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TARGET_ENV: ${{ github.event.inputs.environment || vars.DEPLOY_ENVIRONMENT || 'dev' }}
+  DOCKERHUB_REPOSITORY: arodri19/oficina-exec-prod-service
+  NAMESPACE: oficina-mecanica
+
+jobs:
+  ci:
+    name: CI (testes, cobertura, SonarQube)
+    uses: ./.github/workflows/ci.yml
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  build-and-push:
+    name: Build e push no Docker Hub
+    runs-on: ubuntu-latest
+    needs: ci
+    environment: oficina-prd
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/login-action@v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Calcular tags
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "image=${{ env.DOCKERHUB_REPOSITORY }}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "branch=${{ env.DOCKERHUB_REPOSITORY }}:${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+      - name: Build e push
+        run: |
+          docker build --tag "${{ steps.meta.outputs.image }}" --tag "${{ steps.meta.outputs.branch }}" --tag "${{ env.DOCKERHUB_REPOSITORY }}:latest" .
+          docker push --all-tags "${{ env.DOCKERHUB_REPOSITORY }}"
+
+  deploy:
+    name: Deploy no EKS
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: oficina-prd
+    env:
+      EKS_CLUSTER_NAME: oficina-mecanica-${{ github.event.inputs.environment || vars.DEPLOY_ENVIRONMENT || 'dev' }}
+      QUEUE_PREFIX: oficina-mecanica-${{ github.event.inputs.environment || vars.DEPLOY_ENVIRONMENT || 'dev' }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verificar se o cluster existe
+        id: infra
+        run: |
+          if aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Cluster '$EKS_CLUSTER_NAME' não existe (infra sob demanda desligada). Imagem publicada; deploy pulado."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Terraform
+        if: steps.infra.outputs.ready == 'true'
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: '~1.9'
+
+      - name: Terraform apply — DynamoDB, fila SQS (+DLQ) e IAM do exec-prod
+        if: steps.infra.outputs.ready == 'true'
+        working-directory: terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET || 'oficina-mecanica-terraform-state-769628268406' }}" \
+            -backend-config="key=oficina-mecanica/exec-prod-service/${TARGET_ENV}/terraform.tfstate" \
+            -backend-config="region=$AWS_REGION"
+          terraform apply -input=false -auto-approve \
+            -var="environment=$TARGET_ENV" \
+            -var="tf_state_bucket=${{ vars.TF_STATE_BUCKET || 'oficina-mecanica-terraform-state-769628268406' }}"
+
+      - name: Configurar kubectl
+        if: steps.infra.outputs.ready == 'true'
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+
+      - name: Aplicar namespace, ConfigMap e Secret
+        if: steps.infra.outputs.ready == 'true'
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          sed -i "s|QUEUE_PREFIX: \".*\"|QUEUE_PREFIX: \"$QUEUE_PREFIX\"|; s|MAX_ACTIVE_EXECUTIONS: \".*\"|MAX_ACTIVE_EXECUTIONS: \"${{ vars.MAX_ACTIVE_EXECUTIONS || '10' }}\"|" k8s/configmap.yaml
+          kubectl apply -f k8s/configmap.yaml
+          kubectl create secret generic exec-prod-service-secrets \
+            --namespace="$NAMESPACE" \
+            --from-literal=JWT_SECRET="${{ secrets.JWT_SECRET }}" \
+            --from-literal=NEW_RELIC_LICENSE_KEY="${{ secrets.NEW_RELIC_LICENSE_KEY }}" \
+            --dry-run=client -o yaml > "$RUNNER_TEMP/exec-prod-service-secrets.yaml"
+          kubectl apply -f "$RUNNER_TEMP/exec-prod-service-secrets.yaml"
+
+      - name: Aplicar Deployment, Services e HPA
+        if: steps.infra.outputs.ready == 'true'
+        run: |
+          # checksum de ConfigMap + Secret no pod: reexecutar o CD só com configuração
+          # nova (mesma imagem) também recria os pods
+          CONFIG_HASH=$(cat k8s/configmap.yaml "$RUNNER_TEMP/exec-prod-service-secrets.yaml" | sha256sum | cut -c1-16)
+          sed -i "s|arodri19/oficina-exec-prod-service:[^ ]*|${{ needs.build-and-push.outputs.image }}|g; s|CONFIG_HASH|$CONFIG_HASH|" k8s/deployment.yaml
+          kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/hpa.yaml
+          kubectl rollout status deployment/exec-prod-service -n "$NAMESPACE" --timeout=300s
+
+      - name: Smoke test (/health dentro do cluster)
+        if: steps.infra.outputs.ready == 'true'
+        run: |
+          kubectl run smoke-exec-${{ github.run_id }} -n "$NAMESPACE" --rm -i --restart=Never \
+            --image=curlimages/curl:8.10.1 -- -sf http://exec-prod-service/health
+
+      - name: Resumo do deploy
+        if: always()
+        run: |
+          HOST=$(kubectl get svc exec-prod-service-public -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+          {
+            echo "### Deploy exec-prod-service — ${{ job.status }}"
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| Imagem | \`${{ needs.build-and-push.outputs.image }}\` |"
+            echo "| Ambiente | \`$TARGET_ENV\` |"
+            echo "| Cluster pronto | \`${{ steps.infra.outputs.ready }}\` |"
+            [ -n "$HOST" ] && echo "| Swagger | http://$HOST/api-docs |"
+          } >> "$GITHUB_STEP_SUMMARY"
